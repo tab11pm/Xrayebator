@@ -29,7 +29,7 @@ jobs:
       - name: Install validation dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends jq uuid-runtime ripgrep
+          sudo apt-get install -y --no-install-recommends jq uuid-runtime ripgrep socat nginx
 
       - name: Syntax check core scripts (CI gate)
         run: |

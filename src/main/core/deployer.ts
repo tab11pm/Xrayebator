@@ -260,7 +260,7 @@ export class Deployer {
       this.onStep('save', 'Сохраняю результат...')
       // http_tls-fallback: публичного HTTPS нет (LE не смог проверить http-01 —
       // обычно порт 80 фильтруется хостером), но на сервере всё работает. GUI
-      // вытягивает ключи по SSH (curl на 127.0.0.1:8080 — loopback в firewall
+      // вытягивает ключи по SSH (curl на настроенный loopback-handler — loopback в firewall
       // не нуждается), сервер сохраняется с setupStatus=partial. Мёртвый
       // публичный URL не сохраняем и не пробуем fetch'ить.
       const degraded = payload.degraded === true || payload.tls_mode === 'http_tls'
@@ -329,7 +329,7 @@ function parseQuickstartJson(raw: string): QuickstartJson {
 /**
  * Ключи по SSH в http_tls-fallback: публичный URL подписки недоступен из сети
  * пользователя (хостер фильтрует HTTP/порты), но с server'а loopback работает
- * всегда — curl 127.0.0.1:8080 и парсинг тела локально.
+ * всегда — curl на настроенный loopback-handler и парсинг тела локально.
  */
 async function fetchSubscriptionOverSsh(
   client: SshClient,

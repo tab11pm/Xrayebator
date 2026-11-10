@@ -474,3 +474,27 @@ BTC     34EznmkBGpBu4dUnzoHL5GBnpg2Rq86v4H
 <div align="center">
 <strong>Made for a free internet</strong>
 </div>
+
+
+### Internal subscription handler port
+
+The public HTTPS subscription port is independent of the internal socat handler.
+If another service (for example BeAdmin) uses 8080, select a free loopback port:
+
+```bash
+sudo xrayebator subhttp-config --port 8081
+sudo xrayebator quickstart --without-email
+```
+
+This command also works before the first quickstart. Defaults are
+`SUBHTTP_HOST=127.0.0.1` and `SUBHTTP_PORT=8080` in
+`/etc/xrayebator/xrayebator.env` (root:root, 0600). A missing file uses these defaults.
+Only numeric loopback addresses (`127.x.x.x`, `::1`) are accepted; ports must be
+1–65535. Use plain unquoted assignments, one per line; shell syntax is rejected.
+
+On an installed server `--port` synchronizes the unit and existing nginx upstream,
+checks `nginx -t` and handler HTTP readiness, and rolls back on failure. The
+external HTTPS listener and certificate remain unchanged. For a manual env edit,
+run `sudo xrayebator subhttp-config --apply`; editing the file alone does not
+reconfigure a running service. `sudo xrayebator subhttp-config` shows settings.
+All changes run locally on the server and require root.
