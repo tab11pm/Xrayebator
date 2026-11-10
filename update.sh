@@ -483,6 +483,15 @@ else
   exit 1
 fi
 
+# Synchronize an existing subscription handler without changing its public TLS port.
+# The manager transaction validates nginx and restores the old endpoint on failure.
+if [[ -f /etc/systemd/system/xrayebator-sub.service ]]; then
+  if ! /usr/local/bin/xrayebator subhttp-config --apply; then
+    echo -e "${RED}✗ Subscription handler configuration failed; previous endpoint restored${NC}"
+    exit 1
+  fi
+fi
+
 # Обновление uninstall.sh и восстановление symlink'ов команд.
 echo -e "${YELLOW}Обновление служебных скриптов...${NC}"
 mkdir -p /usr/local/etc/xray/scripts

@@ -65,7 +65,12 @@ ALERTS_EXPIRE_WARN_SEC="${ALERTS_EXPIRE_WARN_SEC:-259200}"
 # правды о живости подписки: он не зависит ни от TLS-режима, ни от nginx.
 ALERTS_SNI_INTERVAL_SEC="${ALERTS_SNI_INTERVAL_SEC:-86400}"
 ALERTS_SNI_TIMEOUT="${ALERTS_SNI_TIMEOUT:-8}"
-SUBHTTP_LOCAL_BASE="${SUBHTTP_LOCAL_BASE:-http://127.0.0.1:8080}"
+SUBHTTP_ENV_FILE="${SUBHTTP_ENV_FILE:-/etc/xrayebator/xrayebator.env}"
+SUBHTTP_UNIT_FILE="${SUBHTTP_UNIT_FILE:-/etc/systemd/system/xrayebator-sub.service}"
+SUBHTTP_EXPECTED_UID=0
+SUBHTTP_HOST=127.0.0.1
+SUBHTTP_PORT=8080
+SUBHTTP_LOCAL_BASE=http://127.0.0.1:8080
 # Пути systemd-юнитов монитора (переопределяемы для функциональных тестов).
 MONITOR_SERVICE_FILE="${MONITOR_SERVICE_FILE:-/etc/systemd/system/xrayebator-monitor.service}"
 MONITOR_TIMER_FILE="${MONITOR_TIMER_FILE:-/etc/systemd/system/xrayebator-monitor.timer}"
@@ -82,6 +87,265 @@ QS_NGINX_MODIFIED=0
 QS_VHOST_BACKUP="$NGINX_SITES_AVAILABLE/xrayebator-sub.xrayebator.bak"
 QS_DEFAULT_REMOVED=false
 QS_DEFAULT_BACKUP_CREATED=false
+
+
+# Subscription handler configuration. Data only: never source/eval the env file.
+_subhttp_error() { echo "✗ SUBHTTP: $*" >&2; return 1; }
+
+_subhttp_validate() {
+  case "$SUBHTTP_HOST" in
+    ::1) SUBHTTP_LISTEN=TCP6-LISTEN; SUBHTTP_AUTHORITY="[::1]:$SUBHTTP_PORT" ;;
+    *)
+      local a b c d
+      [[ "$SUBHTTP_HOST" =~ ^127\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] ||
+        { _subhttp_error 'SUBHTTP_HOST must be a numeric loopback address (127.x.x.x or ::1)'; return 1; }
+      IFS=. read -r a b c d <<< "$SUBHTTP_HOST"
+      for a in "$b" "$c" "$d"; do
+        [[ "$a" == 0 || "$a" != 0* ]] && ((10#$a <= 255)) || return 1
+      done
+      SUBHTTP_LISTEN=TCP4-LISTEN; SUBHTTP_AUTHORITY="$SUBHTTP_HOST:$SUBHTTP_PORT" ;;
+  esac
+  [[ "$SUBHTTP_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && ((SUBHTTP_PORT <= 65535)) ||
+    { _subhttp_error 'SUBHTTP_PORT must be an integer in 1..65535 (no leading zeros)'; return 1; }
+  SUBHTTP_LOCAL_BASE="http://$SUBHTTP_AUTHORITY"
+}
+
+_subhttp_check_config_dir() {
+  local uid mode parent
+  parent=$(dirname "$SUBHTTP_ENV_FILE")
+  [[ -d "$parent" && ! -L "$parent" ]] || return 1
+  read -r uid mode < <(stat -c '%u %a' "$parent")
+  [[ "$uid" == "$SUBHTTP_EXPECTED_UID" ]] && (( (8#$mode & 0022) == 0 )) || {
+    _subhttp_error 'config directory must be root-owned and not writable by group/others'; return 1;
+  }
+}
+
+_subhttp_load_config() {
+  SUBHTTP_HOST=127.0.0.1; SUBHTTP_PORT=8080
+  # systemd supplies only these public numeric values to the unprivileged handler.
+  if ((EUID != 0)) && [[ -n "${SUBHTTP_HANDLER_HOST:-}" && -n "${SUBHTTP_HANDLER_PORT:-}" ]]; then
+    SUBHTTP_HOST="$SUBHTTP_HANDLER_HOST"; SUBHTTP_PORT="$SUBHTTP_HANDLER_PORT"
+    _subhttp_validate; return $?
+  fi
+  local line key value uid mode seen=' '
+  if [[ -e "$SUBHTTP_ENV_FILE" || -L "$SUBHTTP_ENV_FILE" ]]; then
+    _subhttp_check_config_dir || return 1
+    [[ -f "$SUBHTTP_ENV_FILE" && ! -L "$SUBHTTP_ENV_FILE" ]] ||
+      { _subhttp_error 'env must be a regular file, not a symlink'; return 1; }
+    read -r uid mode < <(stat -c '%u %a' "$SUBHTTP_ENV_FILE")
+    [[ "$uid" == "$SUBHTTP_EXPECTED_UID" && "$mode" == 600 ]] ||
+      { _subhttp_error "env must be owned by root with mode 0600: $SUBHTTP_ENV_FILE"; return 1; }
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%$'\r'}"
+      [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
+      [[ "$line" =~ ^(SUBHTTP_HOST|SUBHTTP_PORT)=([^[:space:]]*)$ ]] ||
+        { _subhttp_error 'expected SUBHTTP_HOST=value or SUBHTTP_PORT=value'; return 1; }
+      key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
+      [[ "$seen" != *" $key "* ]] || { _subhttp_error "duplicate $key"; return 1; }
+      seen+="$key "
+      printf -v "$key" '%s' "$value"
+    done < "$SUBHTTP_ENV_FILE"
+  fi
+  _subhttp_validate
+}
+
+_subhttp_save_config() {
+  local tmp parent
+  parent=$(dirname "$SUBHTTP_ENV_FILE")
+  mkdir -p -m 700 "$parent" || return 1
+  _subhttp_check_config_dir || return 1
+  [[ ! -L "$SUBHTTP_ENV_FILE" ]] || return 1
+  tmp=$(mktemp "${SUBHTTP_ENV_FILE}.XXXXXX") || return 1
+  if ! printf 'SUBHTTP_HOST=%s\nSUBHTTP_PORT=%s\n' "$SUBHTTP_HOST" "$SUBHTTP_PORT" > "$tmp" ||
+     ! chmod 600 "$tmp" || ! mv -f "$tmp" "$SUBHTTP_ENV_FILE"; then
+    rm -f "$tmp"; return 1
+  fi
+}
+
+_subhttp_render_unit() {
+  _subhttp_validate || return 1
+  # No EnvironmentFile substitution: systemd does not run ExecStart via a shell.
+  # Render validated numeric literals; the root-only env stays unreadable to xray.
+  cat <<SUBUNIT_EOF
+[Unit]
+Description=Xrayebator HAPP subscription handler (socat + subhttp.sh)
+Documentation=https://github.com/howdeploy/Xrayebator
+After=network-online.target xray.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xray
+Group=xray
+Environment=SUBHTTP_HANDLER_HOST=${SUBHTTP_HOST}
+Environment=SUBHTTP_HANDLER_PORT=${SUBHTTP_PORT}
+ExecStart=/usr/bin/socat ${SUBHTTP_LISTEN}:${SUBHTTP_PORT},reuseaddr,fork,bind=${SUBHTTP_HOST} EXEC:/usr/local/bin/subhttp.sh
+
+# REQ-C09 hardening:
+ProtectSystem=strict
+ReadOnlyPaths=/usr/local/etc/xray /usr/local/share/xray /usr/local/bin/xrayebator /usr/local/bin/subhttp.sh
+ReadWritePaths=/tmp
+NoNewPrivileges=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+SUBUNIT_EOF
+}
+
+_subhttp_port_available() {
+  local listeners pid
+  listeners=$(ss -H -ltnp "sport = :$SUBHTTP_PORT") || return 1
+  [[ -z "$listeners" ]] && return 0
+  # Repeated quickstart may reuse only our running process, never another service.
+  pid=$(systemctl show -p MainPID --value xrayebator-sub.service 2>/dev/null) || pid=0
+  if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && systemctl is-active --quiet xrayebator-sub.service; then
+    local row
+    while IFS= read -r row; do
+      [[ "$row" == *"pid=$pid,"* ]] || {
+        _subhttp_error "$SUBHTTP_AUTHORITY: Address already in use; choose another SUBHTTP_PORT with xrayebator subhttp-config --port 8081"; return 1;
+      }
+    done <<< "$listeners"
+    return 0
+  fi
+  _subhttp_error "$SUBHTTP_AUTHORITY: Address already in use; choose another SUBHTTP_PORT with xrayebator subhttp-config --port 8081"
+}
+
+_subhttp_probe() {
+  local code attempt
+  for attempt in 1 2 3 4 5; do
+    code=$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 2 "$SUBHTTP_LOCAL_BASE/sub/") || code=000
+    [[ "$code" == 404 ]] && return 0
+    sleep 0.2
+  done
+  _subhttp_error "handler not responding at $SUBHTTP_AUTHORITY"
+}
+
+# Apply config + unit + existing nginx upstream as one transaction. Called under
+# the CLI's lock; direct installer callers use the same helper. On failure restore
+# the old endpoint and service, leaving external TLS listeners/certificates intact.
+_subhttp_apply() (
+  if [[ "${SUBHTTP_LOCKED:-0}" != 1 ]]; then
+    mkdir -p "$(dirname "$SUBHTTP_ENV_FILE")" || exit 1
+    _subhttp_check_config_dir || exit 1
+    exec {subhttp_lock_fd}>"${SUBHTTP_ENV_FILE}.lock" || exit 1
+    flock -x "$subhttp_lock_fd" || exit 1
+  fi
+  _subhttp_load_config || exit 1
+  local old_host='' old_port='' was_active=false tmp site="$NGINX_SITES_AVAILABLE/xrayebator-sub"
+  if [[ -f "$SUBHTTP_UNIT_FILE" ]]; then
+    old_port=$(sed -nE 's/^ExecStart=.*TCP[46]?-LISTEN:([0-9]+),.*$/\1/p' "$SUBHTTP_UNIT_FILE")
+    old_host=$(sed -nE 's/^ExecStart=.*bind=([^ ]+) EXEC:.*$/\1/p' "$SUBHTTP_UNIT_FILE")
+  fi
+  if ! _subhttp_port_available; then
+    if [[ -n "$old_host" && -n "$old_port" ]]; then
+      SUBHTTP_HOST="$old_host"; SUBHTTP_PORT="$old_port"
+      _subhttp_validate && _subhttp_save_config
+    fi
+    exit 1
+  fi
+  tmp=$(mktemp -d) || exit 1
+  local changed=0 committed=0
+  if [[ -e "$SUBHTTP_UNIT_FILE" ]]; then cp -p "$SUBHTTP_UNIT_FILE" "$tmp/unit" || exit 1; fi
+  if [[ -e "$site" ]]; then cp -p "$site" "$tmp/site" || exit 1; fi
+  if [[ -e "$SUBHTTP_ENV_FILE" ]]; then cp -p "$SUBHTTP_ENV_FILE" "$tmp/env" || exit 1; fi
+  systemctl is-active --quiet xrayebator-sub.service && was_active=true
+  _subhttp_rollback() {
+    local rc=$?
+    if [[ "$committed" == 0 && "$changed" == 1 ]]; then
+      if [[ -f "$tmp/unit" ]]; then cp -p "$tmp/unit" "$SUBHTTP_UNIT_FILE";
+      else rm -f "$SUBHTTP_UNIT_FILE"; fi
+      [[ -f "$tmp/site" ]] && cp -p "$tmp/site" "$site"
+      if [[ -n "$old_host" && -n "$old_port" ]]; then
+        SUBHTTP_HOST="$old_host"; SUBHTTP_PORT="$old_port"; _subhttp_validate
+        _subhttp_save_config || echo 'SUBHTTP: rollback of env FAILED' >&2
+      elif [[ -f "$tmp/env" ]]; then
+        cp -p "$tmp/env" "$SUBHTTP_ENV_FILE"
+      fi
+      systemctl daemon-reload && {
+        if [[ "$was_active" == true ]]; then systemctl restart xrayebator-sub.service;
+        else systemctl stop xrayebator-sub.service; fi
+      } || echo 'SUBHTTP: rollback of service FAILED; inspect journalctl -u xrayebator-sub' >&2
+      if [[ -f "$tmp/site" ]]; then
+        nginx -t && systemctl reload nginx || echo 'SUBHTTP: rollback of nginx FAILED' >&2
+      fi
+      echo 'SUBHTTP: apply failed; previous configuration restored (see any rollback errors above)' >&2
+    fi
+    rm -rf "$tmp"
+    return "$rc"
+  }
+  trap _subhttp_rollback EXIT
+  trap 'exit 1' HUP INT TERM
+  _subhttp_render_unit > "$tmp/new-unit" || exit 1
+  if [[ -f "$site" ]]; then
+    sed -E "s@proxy_pass http://(127\.[0-9.]+|\[::1\]):[0-9]+;@proxy_pass $SUBHTTP_LOCAL_BASE;@g" "$site" > "$tmp/new-site" || exit 1
+  fi
+  if cmp -s "$tmp/new-unit" "$SUBHTTP_UNIT_FILE" &&
+     { [[ ! -f "$site" ]] || cmp -s "$tmp/new-site" "$site"; } &&
+     [[ "$was_active" == true ]]; then
+    if _subhttp_probe; then
+      _subhttp_save_config || exit 1
+      committed=1; exit 0
+    fi
+  fi
+  changed=1
+  install -m 644 "$tmp/new-unit" "$SUBHTTP_UNIT_FILE" || exit 1
+  if [[ -f "$site" ]]; then
+    cat "$tmp/new-site" > "$site" || exit 1
+    nginx -t || exit 1
+  fi
+  systemctl daemon-reload || exit 1
+  systemctl restart xrayebator-sub.service || exit 1
+  systemctl is-active --quiet xrayebator-sub.service || exit 1
+  _subhttp_port_available || exit 1
+  _subhttp_probe || exit 1
+  [[ ! -f "$site" ]] || systemctl reload nginx || exit 1
+  _subhttp_save_config || exit 1
+  if [[ "${SUBHTTP_PRESERVE_STATE:-0}" == 1 && "$was_active" == false ]]; then
+    systemctl stop xrayebator-sub.service || exit 1
+  fi
+  committed=1
+)
+
+subhttp_config_command() (
+  mkdir -p -m 700 "$(dirname "$SUBHTTP_ENV_FILE")" || exit 1
+  _subhttp_check_config_dir || exit 1
+  exec {subhttp_lock_fd}>"${SUBHTTP_ENV_FILE}.lock" || exit 1
+  flock -x "$subhttp_lock_fd" || exit 1
+  SUBHTTP_LOCKED=1
+  _subhttp_load_config || exit 1
+  if [[ $# == 0 ]]; then
+    printf '{"host":"%s","port":%s}\n' "$SUBHTTP_HOST" "$SUBHTTP_PORT"; exit 0
+  fi
+  if [[ "${1:-}" == --init && $# == 1 ]]; then _subhttp_save_config; exit $?; fi
+  if [[ "${1:-}" == --apply && $# == 1 ]]; then SUBHTTP_PRESERVE_STATE=1 _subhttp_apply; exit $?; fi
+  [[ "${1:-}" == --port && $# == 2 ]] || {
+    _subhttp_error 'usage: subhttp-config [--port PORT | --apply | --init]'; exit 1;
+  }
+  local original_host="$SUBHTTP_HOST" original_port="$SUBHTTP_PORT" rc=0
+  SUBHTTP_PORT="$2"; _subhttp_validate || exit 1
+  _subhttp_port_available || exit 1
+  _subhttp_save_config || exit 1
+  if [[ -f "$SUBHTTP_UNIT_FILE" ]]; then
+    SUBHTTP_PRESERVE_STATE=1 _subhttp_apply || rc=$?
+    if ((rc)); then
+      SUBHTTP_HOST="$original_host"; SUBHTTP_PORT="$original_port"
+      _subhttp_save_config || exit 1
+      exit "$rc"
+    fi
+  fi
+  _subhttp_load_config
+)
 
 # --- Секреты и /proc -------------------------------------------------------
 # /proc/<pid>/cmdline читается ЛЮБЫМ пользователем хоста (права 0444), а
@@ -335,6 +599,8 @@ if [[ "$XRAYEBATOR_SOURCED" -eq 0 ]]; then
     exit 1
   fi
 
+  # Config command must also work before installing Xray/Reality keys.
+  if [[ "${1:-}" != subhttp-config ]]; then
   # Загрузка ключей
   if [[ -f "$PRIVATE_KEY_FILE" ]] && [[ -f "$PUBLIC_KEY_FILE" ]]; then
     PRIVATE_KEY=$(cat "$PRIVATE_KEY_FILE")
@@ -348,6 +614,7 @@ if [[ "$XRAYEBATOR_SOURCED" -eq 0 ]]; then
   else
     echo -e "${RED}✗ Ключи Reality не найдены. Запустите install.sh${NC}"
     exit 1
+  fi
   fi
 fi
 
@@ -1696,6 +1963,7 @@ channel_test_command() {
 }
 
 _subscription_base_url() {
+  _subhttp_load_config || return 1
   local domain port
   domain=$(cat /usr/local/etc/xray/.subscription_domain 2>/dev/null || echo "127.0.0.1")
   port=$(cat /usr/local/etc/xray/.subscription_port 2>/dev/null || echo "8080")
@@ -1703,8 +1971,8 @@ _subscription_base_url() {
   if [[ "$host" == *:* && "$host" != \[* ]]; then
     host="[$host]"
   fi
-  if [[ "$domain" == "127.0.0.1" ]]; then
-    echo "http://${host}:${port}"
+  if [[ "$domain" == 127.* || "$domain" == "localhost" || "$domain" == "::1" ]]; then
+    echo "$SUBHTTP_LOCAL_BASE"
   elif [[ "$port" == "443" ]]; then
     echo "https://${host}"
   else
@@ -1714,10 +1982,11 @@ _subscription_base_url() {
 }
 
 _subscription_is_local_only() {
+  _subhttp_load_config || return 1
   local domain port
   domain=$(cat /usr/local/etc/xray/.subscription_domain 2>/dev/null || echo "127.0.0.1")
   port=$(cat /usr/local/etc/xray/.subscription_port 2>/dev/null || echo "8080")
-  [[ "$domain" == "127.0.0.1" || "$domain" == "localhost" || "$port" == "8080" ]]
+  [[ "$domain" == 127.* || "$domain" == "localhost" || "$domain" == "::1" ]]
 }
 
 # Пишет маркеры .subscription_* atomically и выставляет владельца xray.
@@ -8050,7 +8319,7 @@ probe_test_command() {
 # xrayebator на каждый HTTP-request — лишние сетевые вызовы под xray:xray неприемлемы).
 # В source-режиме SERVER_IP инициализируется пустым; pure-функции берут публичный
 # адрес из HAPP markers, а get_server_ip() используют только как fallback.
-if [[ "$XRAYEBATOR_SOURCED" -eq 0 ]]; then
+if [[ "$XRAYEBATOR_SOURCED" -eq 0 && "${1:-}" != subhttp-config ]]; then
   SERVER_IP=$(get_server_ip)
 else
   SERVER_IP=""
@@ -8551,6 +8820,9 @@ show_pq_banner_once() {
 # Юнит НЕ enable-ится и НЕ start-ится автоматически — этим занимается Plan 7.3 после
 # выбора публичного TLS (default) или local-only fallback.
 install_subscription_server() {
+  _subhttp_load_config || return 1
+  _subhttp_port_available || return 1
+  _subhttp_save_config || return 1
   show_ascii
   echo -e "${BLUE}═══════════════════════════════════════════════${NC}"
   echo -e "${BLUE}     УСТАНОВКА HAPP SUBSCRIPTION SERVER       ${NC}"
@@ -9101,46 +9373,11 @@ HAPP_DEFAULTS_EOF
   fi
 
   # ── (3) systemd unit (REQ-C09 hardening; opt-in, НЕ enable/start здесь) ──
-  cat > /etc/systemd/system/xrayebator-sub.service << 'SUBUNIT_EOF'
-[Unit]
-Description=Xrayebator HAPP subscription handler (socat + subhttp.sh)
-Documentation=https://github.com/howdeploy/Xrayebator
-After=network-online.target xray.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=xray
-Group=xray
-ExecStart=/usr/bin/socat TCP-LISTEN:8080,reuseaddr,fork,bind=127.0.0.1 EXEC:/usr/local/bin/subhttp.sh
-
-# REQ-C09 hardening:
-ProtectSystem=strict
-ReadOnlyPaths=/usr/local/etc/xray /usr/local/share/xray /usr/local/bin/xrayebator /usr/local/bin/subhttp.sh
-ReadWritePaths=/tmp
-NoNewPrivileges=yes
-MemoryDenyWriteExecute=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-PrivateDevices=yes
-PrivateTmp=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-LockPersonality=yes
-
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-SUBUNIT_EOF
-
-  chmod 644 /etc/systemd/system/xrayebator-sub.service
-  chown root:root /etc/systemd/system/xrayebator-sub.service
-  echo -e "${GREEN}  ✓ /etc/systemd/system/xrayebator-sub.service создан${NC}"
-
-  # daemon-reload — чтобы systemctl увидел новый unit. НЕ enable, НЕ start.
-  systemctl daemon-reload 2>/dev/null || true
+  # Existing units are updated together with nginx, never overwritten here.
+  if [[ ! -e "$SUBHTTP_UNIT_FILE" ]]; then
+    _subhttp_render_unit > "$SUBHTTP_UNIT_FILE" || return 1
+    chmod 644 "$SUBHTTP_UNIT_FILE" || return 1
+  fi
 
   # Marker (opt-in активирован) — Plan 7.3 проверит наличие для меню/preflight.
   touch /usr/local/etc/xray/.subscription_installed
@@ -9242,13 +9479,12 @@ _happ_ensure_default_multiroute_profile() {
 }
 
 _subscription_ensure_handler_running() {
+  _subhttp_load_config || return 1
   if [[ ! -f /usr/local/etc/xray/.subscription_installed ]]; then
     return 1
   fi
 
-  if ! systemctl is-active --quiet xrayebator-sub.service; then
-    _subscription_restart_service || return 1
-  fi
+  _subscription_restart_service || return 1
 
   # A4-fix: is-active мало — проверяем реальную отдачу подписки через локальный
   # HTTP self-test. Иначе GUI получит ok:true с мёртвым URL (502/410 на клиенте).
@@ -9262,7 +9498,7 @@ _subscription_ensure_handler_running() {
     _subscription_local_self_test "$sub_token"
   else
     # Нет профиля с токеном — хотя бы проверим, что порт слушается.
-    if ss -ltn 2>/dev/null | grep -q ':8080 '; then
+    if _subhttp_probe; then
       return 0
     fi
     return 1
@@ -9271,14 +9507,9 @@ _subscription_ensure_handler_running() {
 
 _subscription_restart_service() {
   ensure_xray_runtime_user >/dev/null 2>&1 || return 1
-  [[ -f /etc/systemd/system/xrayebator-sub.service ]] || return 1
-
-  systemctl daemon-reload 2>/dev/null || true
-  systemctl reset-failed xrayebator-sub.service 2>/dev/null || true
-  systemctl enable xrayebator-sub.service >/dev/null 2>&1 || return 1
-  systemctl restart xrayebator-sub.service >/dev/null 2>&1 || return 1
-  sleep 1
-  systemctl is-active --quiet xrayebator-sub.service
+  [[ -f "$SUBHTTP_UNIT_FILE" ]] || return 1
+  _subhttp_apply || return 1
+  systemctl enable xrayebator-sub.service >/dev/null 2>&1
 }
 
 _subscription_repair_handler() {
@@ -9291,6 +9522,7 @@ _subscription_repair_handler() {
 }
 
 _subscription_local_self_test() {
+  _subhttp_load_config || return 1
   local token="$1"
   [[ "$token" =~ ^[a-f0-9]{32}$ ]] || return 1
 
@@ -9310,7 +9542,7 @@ _subscription_local_self_test() {
   }
 
   local http_status curl_rc=0
-  http_status=$(_curl_secret_url "http://127.0.0.1:8080/sub/${token}" \
+  http_status=$(_curl_secret_url "${SUBHTTP_LOCAL_BASE}/sub/${token}" --noproxy '*' \
       -sS --connect-timeout 2 --max-time 30 \
       -o "$body_tmp" -w '%{http_code}' 2>"$err_tmp") || curl_rc=$?
   SUBSCRIPTION_SELFTEST_HTTP_STATUS="$http_status"
@@ -9366,7 +9598,7 @@ _happ_print_subscription_url_for_profile() {
   echo -e "${BLUE}Профиль:${NC} ${GREEN}${profile_name}${NC}"
   if ! _subscription_ensure_profile_ready "$token"; then
     echo -e "${RED}✗ HAPP subscription handler не отдаёт локальную подписку.${NC}"
-    echo -e "${YELLOW}  Внешний клиент получит 502 Bad Gateway, пока 127.0.0.1:8080 не оживёт.${NC}"
+    echo -e "${YELLOW}  Внешний клиент получит 502 Bad Gateway, пока ${SUBHTTP_AUTHORITY} не оживёт.${NC}"
     _subscription_print_selftest_failure
     echo -e "${YELLOW}  Диагностика: systemctl status xrayebator-sub --no-pager -l${NC}"
     echo -e "${YELLOW}  Логи: journalctl -u xrayebator-sub -n 80 --no-pager${NC}"
@@ -9557,7 +9789,7 @@ server {
         proxy_buffer_size 32k;
         proxy_buffers 8 32k;
         proxy_busy_buffers_size 64k;
-        proxy_pass http://127.0.0.1:8080;
+        proxy_pass ${SUBHTTP_LOCAL_BASE};
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
@@ -9797,7 +10029,7 @@ server {
         proxy_buffer_size 32k;
         proxy_buffers 8 32k;
         proxy_busy_buffers_size 64k;
-        proxy_pass http://127.0.0.1:8080;
+        proxy_pass ${SUBHTTP_LOCAL_BASE};
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
@@ -10081,6 +10313,7 @@ _dns01_credentials_write() {
 # nginx-vhost подписки для DNS-01: только TLS-сервер, БЕЗ listen 80 и без
 # ACME-location — сертификат уже выдан, а порт 80 этому режиму не нужен.
 _dns01_nginx_vhost_pure() {
+  _subhttp_load_config || return 1
   local domain="$1" port="$2" cert_dir="$3"
   cat << VHOST
 limit_req_zone \$binary_remote_addr zone=xrayebator_sub:10m rate=30r/m;
@@ -10103,7 +10336,7 @@ server {
         proxy_buffer_size 32k;
         proxy_buffers 8 32k;
         proxy_busy_buffers_size 64k;
-        proxy_pass http://127.0.0.1:8080;
+        proxy_pass ${SUBHTTP_LOCAL_BASE};
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
@@ -10724,18 +10957,19 @@ install_subscription_dns01() {
 # Без nginx, без certbot, БЕЗ открытия UFW (loopback bypasses firewall).
 # Доступ — только через ssh-tunnel: ssh -L 8080:127.0.0.1:8080 user@vps.
 install_subscription_local_only() {
+  _subhttp_load_config || return 1
   show_ascii
   echo -e "${BLUE}═══════════════════════════════════════════════${NC}"
   echo -e "${BLUE}    УСТАНОВКА ПОДПИСКИ (LOCAL-ONLY FALLBACK) ${NC}"
   echo -e "${BLUE}═══════════════════════════════════════════════${NC}"
   echo ""
-  echo -e "${YELLOW}⚠ Подписки доступны только локально (127.0.0.1:8080).${NC}"
-  echo -e "${YELLOW}  Доступ — через ssh-tunnel: ssh -L 8080:127.0.0.1:8080 user@vps${NC}"
+  echo -e "${YELLOW}⚠ Подписки доступны только локально (${SUBHTTP_AUTHORITY}).${NC}"
+  echo -e "${YELLOW}  Доступ — через ssh-tunnel: ssh -L 8080:${SUBHTTP_AUTHORITY} user@vps${NC}"
   echo ""
 
   install_subscription_server || return 1
 
-  echo "8080" > /usr/local/etc/xray/.subscription_port
+  echo "$SUBHTTP_PORT" > /usr/local/etc/xray/.subscription_port
   echo "127.0.0.1" > /usr/local/etc/xray/.subscription_domain
   get_server_ip > /usr/local/etc/xray/.subscription_server_addr 2>/dev/null || true
   echo "local_only" > /usr/local/etc/xray/.subscription_mode
@@ -10753,7 +10987,7 @@ install_subscription_local_only() {
   _happ_profile="$HAPP_DEFAULT_PROFILE"
 
   echo ""
-  echo -e "${GREEN}✓ Local-only handler запущен на 127.0.0.1:8080${NC}"
+  echo -e "${GREEN}✓ Local-only handler запущен на ${SUBHTTP_AUTHORITY}${NC}"
   echo -e "${CYAN}  UFW: порт НЕ открыт (loopback bypass).${NC}"
   _happ_print_subscription_url_for_profile "$_happ_profile"
   echo ""
@@ -11157,6 +11391,7 @@ edit_happ_announce_menu() {
 # Status-line через _subscription_base_url (B1 — никакого инлайн-построения).
 # M6: read с -r.
 happ_subscription_menu() {
+  _subhttp_load_config || return 1
   while true; do
     show_ascii
     echo -e "${BLUE}═══════════════════════════════════════════════${NC}"
@@ -11183,7 +11418,7 @@ happ_subscription_menu() {
 
     echo -e "${CYAN} 1)${NC} Создать HAPP-подписку по IP VPS ${GREEN}(профиль 7 маршрутов / в HAPP все 7, PQ включён + URL/QR)${NC}"
     echo -e "${CYAN} 2)${NC} Создать HAPP-подписку по домену ${GREEN}(профиль 7 маршрутов / в HAPP все 7, PQ включён + URL/QR)${NC}"
-    echo -e "${CYAN} 3)${NC} Local-only debug (127.0.0.1:8080)"
+    echo -e "${CYAN} 3)${NC} Local-only debug (${SUBHTTP_AUTHORITY})"
     echo -e "${CYAN} 4)${NC} Управление существующими подписками (URL / QR / revoke)"
     echo -e "${CYAN} 5)${NC} Настройки HAPP (.happ_defaults.env)"
     echo -e "${CYAN} 6)${NC} Настроить announcement (HAPP)"
@@ -15107,6 +15342,7 @@ uninstall_adguard_home() {
 # xrayebator inspect --json — read-only диагностика установки для GUI-импорта.
 # Никаких изменений состояния: только чтение маркеров, профилей и статуса сервисов.
 inspect_command() {
+  _subhttp_load_config || return 1
   export TERM=dumb
   export XRAYEBATOR_NONINTERACTIVE=1
 
@@ -15206,6 +15442,7 @@ inspect_command() {
     --arg subscription_mode "${sub_mode:-unknown}" \
     --arg subscription_domain "$sub_domain" \
     --argjson subscription_port "$sub_port_json" \
+    --arg subhttp_host "$SUBHTTP_HOST" --argjson subhttp_port "$SUBHTTP_PORT" \
     --arg subscription_service "$sub_service" \
     --arg subscription_url "$sub_url" \
     --arg country "$geo_country" --arg city "$geo_city" --arg flag "$flag" \
@@ -15215,11 +15452,16 @@ inspect_command() {
       subscription_installed:$subscription_installed, subscription_mode:$subscription_mode,
       subscription_domain:$subscription_domain, subscription_port:$subscription_port,
       subscription_service:$subscription_service, subscription_url:$subscription_url,
+      subhttp_host:$subhttp_host, subhttp_port:$subhttp_port,
       country:$country, city:$city, flag:$flag, backends:$backends}'
   return 0
 }
 
 quickstart_command() {
+  if ! _subhttp_load_config || ! _subhttp_port_available; then
+    echo '{"ok":false,"error":"Invalid SUBHTTP configuration or occupied handler port; see stderr. Use xrayebator subhttp-config --port FREE_PORT"}'
+    return 1
+  fi
   local email="" email_mode="provided" deploy_pq=false staging_flag=false
   local secret_src="" secret_argv=false
   local dns01_domain="" dns01_provider="" dns01_token="" dns01_aws_key="" dns01_aws_secret=""
@@ -15542,7 +15784,7 @@ NGINXHTTP
   # certonly — иначе повторный quickstart упирается в Let's Encrypt rate-limit.
   # IP-серты shortlived (~6 дн.); renew-таймер продлевает их в фоне.
   # SUB_TLS_MODE: ip_tls (LE-серт, HTTPS :8443) | http_tls (degraded fallback —
-  # HTTP :8080 наружу). Оба проксируют один и тот же локальный handler.
+  # loopback HTTP). Оба проксируют один и тот же локальный handler.
   local SUB_TLS_MODE="ip_tls"
   local cert_dir="/etc/letsencrypt/live/$server_ip"
   local cert_expiry_ok=0
@@ -15637,7 +15879,7 @@ NGINXHTTP
         # Fallback 2 (http_tls): hoster-уровневая блокировка http-01 (LE validation
         # получает "Connection reset by peer" — порт 80 фильтруется upstream до нашего
         # стека; подтверждено tcpdump + check-host на реальном развёртывании, 2026-10-08).
-        # Вместо dead-end: поднимаем подписку по HTTP (handler на 8080 открыт наружу,
+        # Вместо dead-end: сохраняем loopback-подписку (доступна только через SSH,
         # 404 без токена, токен — bearer) с self-signed сертом для Hysteria и честным
         # маркером degraded в JSON. Повторный quickstart ПОСЛЕ разблокировки :80 у
         # хостера выдаст LE-серт и вернёт ip_tls (идемпотентен).
@@ -15658,7 +15900,7 @@ NGINXHTTP
           echo "  -> certbot: ${certbot_reason}" >&2
         fi
         echo "  ⚠ LE не смог проверить http-01 (порт 80 заблокирован upstream хостера)." >&2
-        echo "  ⚠ Подписка разворачивается по HTTP (fallback): http://${server_ip}:8080/sub/<token>" >&2
+        echo "  ⚠ Подписка доступна только через SSH: ${SUBHTTP_LOCAL_BASE}/sub/<token>" >&2
         echo "    Токен URL остаётся bearer-credential; повторите quickstart после разблокировки :80 —" >&2
         echo "    тогда будет выпущен LE-серт и подписка вернётся на HTTPS." >&2
         fi
@@ -15709,8 +15951,8 @@ NGINXHTTP
     fi
   fi
 
-  # Nginx config: https (ip_tls: LE-серт, прокси на 8080) или http (http_tls
-  # fallback: 8080 открыт напрямую, ACME-challenge на :80 остаётся для
+  # Nginx config: https (ip_tls: LE-серт, прокси на loopback) или http (http_tls
+  # fallback: handler остаётся на loopback, ACME-challenge на :80 остаётся для
   # будущего апгрейда до LE-серта повторным quickstart).
   if [[ "$SUB_TLS_MODE" == "domain_tls" ]]; then
     # vhost уже нарисован _dns01_install (один TLS-сервер домена) и nginx перезагружен.
@@ -15754,7 +15996,7 @@ server {
         proxy_buffer_size 32k;
         proxy_buffers 8 32k;
         proxy_busy_buffers_size 64k;
-        proxy_pass http://127.0.0.1:8080;
+        proxy_pass ${SUBHTTP_LOCAL_BASE};
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -15790,7 +16032,7 @@ NGINXHTTPS
   fi
 
   # Пишем маркеры подписки: ip_tls (LE-серт на :8443) или http_tls (fallback —
-  # handler 8080 напрямую). Иначе _subscription_base_url вернёт локальный
+  # loopback handler). Иначе _subscription_base_url вернёт локальный
   # http://127.0.0.1:8080 и GUI/happ-setup покажут неверный URL и mode "unknown".
   # domain_tls — исключение: маркеры (домен + domain_tls) уже записал _dns01_install,
   # перезапись IP-адресом вернула бы GUI мёртвый URL https://<ip>:8443.
@@ -15860,7 +16102,7 @@ NGINXHTTPS
 
   # Убедиться что subscription handler отвечает.
   if ! _subscription_ensure_handler_running >/dev/null 2>&1; then
-    echo '{"ok":false,"error":"Subscription handler не отвечает на 127.0.0.1:8080"}'
+    jq -n --arg error "Subscription handler не отвечает на $SUBHTTP_AUTHORITY" '{ok:false,error:$error}'
     _qs_nginx_rollback
     return 1
   fi
@@ -15877,7 +16119,7 @@ NGINXHTTPS
   base=$(_subscription_base_url)
   # Если .subscription_* markers не созданы (возможно при раннем вызове),
   # fallback на текущий server_ip + 8443 для обратной совместимости.
-  if [[ -z "$base" ]] || [[ "$base" == *"127.0.0.1:8080"* && ! -f "/usr/local/etc/xray/.subscription_domain" && ! -f "/usr/local/etc/xray/.subscription_port" ]]; then
+  if [[ -z "$base" ]] || [[ "$base" == "$SUBHTTP_LOCAL_BASE" && ! -f "/usr/local/etc/xray/.subscription_domain" && ! -f "/usr/local/etc/xray/.subscription_port" ]]; then
     base="https://${server_ip_bracketed}:8443"
   fi
   subscription_url="${base}/sub/${result_sub_token}"
@@ -15929,6 +16171,10 @@ NGINXHTTPS
 }
 
 happ_setup_command() {
+  if ! _subhttp_load_config || ! _subhttp_port_available; then
+    echo '{"ok":false,"error":"Invalid SUBHTTP configuration or occupied handler port; see stderr. Use xrayebator subhttp-config --port FREE_PORT"}'
+    return 1
+  fi
   export TERM=dumb
   export DEBIAN_FRONTEND=noninteractive
   export XRAYEBATOR_NONINTERACTIVE=1
@@ -17499,7 +17745,7 @@ _monitor_boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unk
 # ── Точки подмены для функционального теста (тот же приём, что _monitor_boot_id):
 # боевые пути и внешние команды не зашиты в monitor-check напрямую.
 _monitor_sub_dir() { echo "/usr/local/etc/xray"; }
-_monitor_sub_local_base() { echo "$SUBHTTP_LOCAL_BASE"; }
+_monitor_sub_local_base() { _subhttp_load_config || return 1; echo "$SUBHTTP_LOCAL_BASE"; }
 _monitor_hysteria_unit() { echo "${HYSTERIA2_UNIT:-hysteria-server.service}"; }
 _monitor_awg_iface() { echo "${AWG_IFACE:-awg0}"; }
 
@@ -17543,7 +17789,7 @@ _monitor_sub_probe() {
   local token="$1" body code
   MONITOR_SUB_CODE="000"
   body=$(mktemp) || return 1
-  code=$(_curl_secret_url "$(_monitor_sub_local_base)/sub/${token}" \
+  code=$(_curl_secret_url "$(_monitor_sub_local_base)/sub/${token}" --noproxy '*' \
     -sS --connect-timeout 3 --max-time 15 -o "$body" -w '%{http_code}' 2>/dev/null) || code="000"
   MONITOR_SUB_CODE="${code:-000}"
   if [[ "$MONITOR_SUB_CODE" == "200" ]] && grep -qE '(vless|hysteria2)://' "$body" 2>/dev/null; then
@@ -17652,6 +17898,7 @@ _monitor_apply_event() {
 
 # xrayebator monitor-check — одна итерация мониторинга (systemd-таймер, 15 мин).
 monitor_check_command() {
+  _subhttp_load_config || return 1
   export TERM=dumb
   export XRAYEBATOR_NONINTERACTIVE=1
 
@@ -17806,7 +18053,7 @@ monitor_check_command() {
   esac
 
   # --- Подписка: loopback-хендлер отвечает + режим TLS не деградировал ---
-  # Хендлер (:8080) — источник правды: nginx лишь проксирует его, поэтому проба
+  # Loopback-хендлер — источник правды: nginx лишь проксирует его, поэтому проба
   # не зависит от TLS-режима. Токен берём у первого профиля с валидным sub_token.
   local sub_dir sub_mode="" sub_token="" sub_mode_known=0
   sub_dir=$(_monitor_sub_dir)
@@ -17826,7 +18073,7 @@ monitor_check_command() {
     rc=0
     if [[ "$state" == "bad" ]]; then
       _monitor_apply_event "sub_handler" bad "bad" \
-        "🔴 $host: подписка не отвечает (loopback :8080, HTTP $MONITOR_SUB_CODE)" "" || rc=$?
+        "🔴 $host: подписка не отвечает (loopback $SUBHTTP_AUTHORITY, HTTP $MONITOR_SUB_CODE)" "" || rc=$?
     else
       _monitor_apply_event "sub_handler" ok "" "" "✅ $host: подписка отвечает" || rc=$?
     fi
@@ -20155,6 +20402,10 @@ if [[ "$XRAYEBATOR_SOURCED" -eq 0 ]]; then
     quickstart)
       shift
       quickstart_command "$@"
+      ;;
+    subhttp-config)
+      shift
+      subhttp_config_command "$@"
       ;;
     inspect)
       shift

@@ -381,7 +381,7 @@ export function registerIpcHandlers({ store }: IpcContext): void {
     const server = store.get(serverId)
     if (!server) throw new Error('Сервер не найден')
     // http_tls-fallback: публичный URL недоступен с клиента — ключи тянутся
-    // curl'ом на самом server'е (loopback 127.0.0.1:8080).
+    // curl'ом на самом server'е (настроенный loopback-handler).
     const { keys, hysteria2Links } = server.degraded
       ? await fetchSubscriptionViaServer(serverId, server.subscriptionUrl)
       : await fetchSubscription(server.subscriptionUrl)

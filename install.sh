@@ -1218,6 +1218,12 @@ else
   exit 1
 fi
 
+# Root-only subscription configuration; preserve existing validated settings.
+if ! /usr/local/bin/xrayebator subhttp-config --init; then
+  echo -e "${RED}✗ Invalid subscription handler configuration${NC}"
+  exit 1
+fi
+
 # Скрипты управления (атомарная установка, P0-privilege-boundary-fix):
 # mktemp в /tmp + chmod 755 + mv (rename) — файл не бывает «полузаписан».
 # После mv проверяем ownership/mode: root:root 755, иначе скрипт подменяем xray.
