@@ -593,3 +593,27 @@ skipped silently. On an older build, install from a branch that contains the fix
 Copy the full error text from the terminal. For installation failures, include the relevant
 `/tmp/xrayebator-*.log` file and the output of `systemctl status xray --no-pager -l`. If the problem is
 in Xrayebator code, open an issue.
+
+
+### Internal subscription handler port
+
+The public HTTPS subscription port is independent of the internal socat handler.
+If another service (for example BeAdmin) uses 8080, select a free loopback port:
+
+```bash
+sudo xrayebator subhttp-config --port 8081
+sudo xrayebator quickstart --without-email
+```
+
+This command also works before the first quickstart. Defaults are
+`SUBHTTP_HOST=127.0.0.1` and `SUBHTTP_PORT=8080` in
+`/etc/xrayebator/xrayebator.env` (root:root, 0600). A missing file uses these defaults.
+Only numeric loopback addresses (`127.x.x.x`, `::1`) are accepted; ports must be
+1–65535. Use plain unquoted assignments, one per line; shell syntax is rejected.
+
+On an installed server `--port` synchronizes the unit and existing nginx upstream,
+checks `nginx -t` and handler HTTP readiness, and rolls back on failure. The
+external HTTPS listener and certificate remain unchanged. For a manual env edit,
+run `sudo xrayebator subhttp-config --apply`; editing the file alone does not
+reconfigure a running service. `sudo xrayebator subhttp-config` shows settings.
+All changes run locally on the server and require root.

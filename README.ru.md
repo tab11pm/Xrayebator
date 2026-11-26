@@ -472,3 +472,26 @@ BTC     34EznmkBGpBu4dUnzoHL5GBnpg2Rq86v4H
 <div align="center">
 <strong>Сделано для свободного интернета</strong>
 </div>
+
+
+### Внутренний порт обработчика подписки
+
+Внешний HTTPS-порт подписки независим от внутреннего socat-handler. Если 8080
+занят, например BeAdmin, выберите свободный loopback-порт:
+
+```bash
+sudo xrayebator subhttp-config --port 8081
+sudo xrayebator quickstart --without-email
+```
+
+Команда работает и до первого quickstart. Файл `/etc/xrayebator/xrayebator.env`
+(root:root, 0600) содержит `SUBHTTP_HOST=127.0.0.1` и `SUBHTTP_PORT=8080` по
+умолчанию; отсутствие файла сохраняет эти значения. Допускаются только числовые
+loopback-адреса `127.x.x.x`/`::1` и порты 1–65535. Формат — простые присваивания
+без кавычек и shell-команд, по одному на строку.
+
+На установленном сервере `--port` синхронно обновляет unit и upstream nginx,
+проверяет `nginx -t` и HTTP-ответ handler, выполняет откат при ошибке. Внешний
+HTTPS-порт и сертификат сохраняются. После ручного редактирования env выполните
+`sudo xrayebator subhttp-config --apply`: одно редактирование не меняет работающий
+сервис. `sudo xrayebator subhttp-config` показывает настройки.
